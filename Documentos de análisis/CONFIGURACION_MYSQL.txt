@@ -1,0 +1,198 @@
+================================================================================
+  CONFIGURACION MYSQL - GRUPO ABG
+  Sistema de Validación CFDI
+================================================================================
+
+DATOS DE CONEXION MYSQL
+========================
+
+Host:           localhost
+Puerto:         3306
+Base de datos:  grupoabg
+Usuario:        root
+Contraseña:     Grup04bg$
+
+Ruta MySQL:     C:\Program Files\MySQL\MySQL Workbench 8.0 CE\
+
+
+ARCHIVOS DE CONFIGURACION
+==========================
+
+1. Archivo .env (ya configurado)
+   Ubicación: C:\Dev\Sots\Coliman\Dev\.env
+   Contiene las credenciales de MySQL para la aplicación
+
+2. Scripts SQL
+   - database/schema_grupoabg.sql    -> Crear tablas
+   - database/init_grupoabg.sql      -> Verificar BD
+
+
+COMO CREAR LAS TABLAS
+======================
+
+OPCION 1 - Script Automático (MAS FACIL)
+-----------------------------------------
+1. Abrir CMD
+2. cd C:\Dev\Sots\Coliman\Dev
+3. scripts\setup_mysql_grupoabg.bat
+4. ¡Listo!
+
+
+OPCION 2 - MySQL Workbench (VISUAL)
+------------------------------------
+1. Abrir MySQL Workbench
+2. Conectar con:
+   - Host: localhost
+   - Puerto: 3306
+   - Usuario: root
+   - Contraseña: Grup04bg$
+
+3. File -> Open SQL Script
+4. Seleccionar: C:\Dev\Sots\Coliman\Dev\database\schema_grupoabg.sql
+5. Click en Execute (rayo)
+6. Verificar con: USE grupoabg; SHOW TABLES;
+
+
+OPCION 3 - Línea de Comandos
+-----------------------------
+CMD:
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -pGrup04bg$
+
+MySQL:
+USE grupoabg;
+SOURCE C:\Dev\Sots\Coliman\Dev\database\schema_grupoabg.sql;
+SHOW TABLES;
+exit;
+
+
+TABLAS QUE SE CREARAN (9 en total)
+===================================
+
+1. proveedores              - Catálogo de proveedores
+2. clientes                 - Catálogo de clientes
+3. ordenes_compra           - Órdenes de compra
+4. cfdi                     - CFDIs
+5. cfdi_conceptos           - Líneas de detalle CFDI
+6. validaciones             - Resultados de validaciones
+7. movimientos_bancarios    - Estados de cuenta
+8. conciliaciones           - Reportes de conciliación
+9. logs_sistema             - Logs y auditoría
+
+
+VERIFICAR INSTALACION
+=====================
+
+En MySQL Workbench o línea de comandos:
+
+USE grupoabg;
+SHOW TABLES;
+
+-- Deberías ver 9 tablas
+
+-- Ver estructura de una tabla
+DESCRIBE cfdi;
+
+-- Verificar que no hay datos aún
+SELECT COUNT(*) FROM cfdi;
+-- Debería mostrar 0
+
+
+SIGUIENTE PASO
+==============
+
+Después de crear las tablas, generar datos de prueba:
+
+1. cd C:\Dev\Sots\Coliman\Dev
+2. venv\Scripts\activate
+3. python scripts\generate_dummy_data.py
+
+Esto creará:
+- 30 Proveedores
+- 10 Clientes
+- 50 Órdenes de Compra
+- 100 CFDI
+- 150 Movimientos Bancarios
+
+
+VERIFICAR DATOS
+===============
+
+Después de generar datos:
+
+USE grupoabg;
+
+-- Contar CFDI
+SELECT COUNT(*) as total_cfdi FROM cfdi;
+-- Debería mostrar 100
+
+-- Ver distribución
+SELECT estatus_validacion, COUNT(*) as cantidad
+FROM cfdi
+GROUP BY estatus_validacion;
+
+-- Ver proveedores
+SELECT COUNT(*) as total_proveedores FROM proveedores;
+-- Debería mostrar 30
+
+
+SOLUCIÓN DE PROBLEMAS
+=====================
+
+1. "Can't connect to MySQL server"
+   -> Verificar que MySQL esté corriendo
+   -> Servicios de Windows -> MySQL80 -> Iniciar
+
+2. "Access denied for user 'root'"
+   -> Verificar contraseña: Grup04bg$
+   -> Verificar que el usuario root existe
+
+3. "Unknown database 'grupoabg'"
+   -> La base de datos no existe
+   -> Crearla con: CREATE DATABASE grupoabg;
+
+4. "Table already exists"
+   -> Las tablas ya fueron creadas anteriormente
+   -> Puedes eliminarlas con: DROP TABLE nombre_tabla;
+   -> O usar el script que tiene IF NOT EXISTS
+
+
+COMANDOS UTILES
+===============
+
+# Ver todas las bases de datos
+SHOW DATABASES;
+
+# Seleccionar base de datos
+USE grupoabg;
+
+# Ver todas las tablas
+SHOW TABLES;
+
+# Ver estructura de tabla
+DESCRIBE cfdi;
+SHOW CREATE TABLE cfdi;
+
+# Borrar datos pero mantener estructura
+TRUNCATE TABLE cfdi;
+
+# Borrar tabla completamente
+DROP TABLE IF EXISTS cfdi;
+
+# Hacer backup
+mysqldump -u root -pGrup04bg$ grupoabg > backup.sql
+
+# Restaurar backup
+mysql -u root -pGrup04bg$ grupoabg < backup.sql
+
+
+CONTACTO Y SOPORTE
+==================
+
+- Ver: INICIO_RAPIDO_GRUPOABG.md
+- Ver: INSTALLATION.md
+- Ver: README.md
+
+
+================================================================================
+Última actualización: 2025-12-03
+================================================================================

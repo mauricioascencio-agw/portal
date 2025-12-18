@@ -1,0 +1,540 @@
+# -*- coding: utf-8 -*-
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import datetime
+import xml.etree.ElementTree as ET
+import os
+import shutil
+from pathlib import Path
+import zipfile
+import tempfile
+try:
+    import rarfile
+except ImportError:
+    rarfile = None
+
+from ..db.database import get_db
+from ..core.security import get_current_user
+from ..models.user import User
+
+router = APIRouter(prefix="/api/cfdis", tags=["cfdis"])
+
+# Namespace del SAT para CFDI 4.0
+NAMESPACES = {
+    'cfdi': 'http://www.sat.gob.mx/cfd/4',
+    'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
+}
+
+def parse_cfdi_xml(xml_content: bytes) -> dict:
+    """Parse CFDI XML and extract main fields"""
+    try:
+        root = ET.fromstring(xml_content)
+
+        # Obtener UUID del timbre fiscal
+        timbre = root.find('.//tfd:TimbreFiscalDigital', NAMESPACES)
+        uuid = timbre.get('UUID') if timbre is not None else None
+
+        # Datos del comprobante
+        comprobante_data = {
+            'uuid': uuid,
+            'version': root.get('Version'),
+            'fecha': root.get('Fecha'),
+            'sello': root.get('Sello'),
+            'forma_pago': root.get('FormaPago'),
+            'no_certificado': root.get('NoCertificado'),
+            'subtotal': float(root.get('SubTotal', 0)),
+            'moneda': root.get('Moneda'),
+            'total': float(root.get('Total', 0)),
+            'tipo_comprobante': root.get('TipoDeComprobante'),
+            'metodo_pago': root.get('MetodoPago'),
+            'lugar_expedicion': root.get('LugarExpedicion'),
+        }
+
+        # Datos del emisor
+        emisor = root.find('.//cfdi:Emisor', NAMESPACES)
+        if emisor is not None:
+            comprobante_data['emisor_rfc'] = emisor.get('Rfc')
+            comprobante_data['emisor_nombre'] = emisor.get('Nombre')
+            comprobante_data['emisor_regimen'] = emisor.get('RegimenFiscal')
+
+        # Datos del receptor
+        receptor = root.find('.//cfdi:Receptor', NAMESPACES)
+        if receptor is not None:
+            comprobante_data['receptor_rfc'] = receptor.get('Rfc')
+            comprobante_data['receptor_nombre'] = receptor.get('Nombre')
+            comprobante_data['receptor_uso_cfdi'] = receptor.get('UsoCFDI')
+
+        # Impuestos
+        impuestos = root.find('.//cfdi:Impuestos', NAMESPACES)
+        if impuestos is not None:
+            comprobante_data['total_impuestos_trasladados'] = float(impuestos.get('TotalImpuestosTrasladados', 0))
+            comprobante_data['total_impuestos_retenidos'] = float(impuestos.get('TotalImpuestosRetenidos', 0))
+
+        # Conceptos
+        conceptos = []
+        for concepto in root.findall('.//cfdi:Concepto', NAMESPACES):
+            concepto_data = {
+                'clave_prod_serv': concepto.get('ClaveProdServ'),
+                'cantidad': float(concepto.get('Cantidad', 0)),
+                'clave_unidad': concepto.get('ClaveUnidad'),
+                'unidad': concepto.get('Unidad'),
+                'descripcion': concepto.get('Descripcion'),
+                'valor_unitario': float(concepto.get('ValorUnitario', 0)),
+                'importe': float(concepto.get('Importe', 0)),
+                'descuento': float(concepto.get('Descuento', 0))
+            }
+            conceptos.append(concepto_data)
+
+        comprobante_data['conceptos'] = conceptos
+
+        return comprobante_data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al parsear XML: {str(e)}")
+
+
+def extract_compressed_file(file_content: bytes, filename: str) -> List[tuple]:
+    """Extract XML files from ZIP or RAR archives"""
+    xml_files = []
+
+    # Crear directorio temporal
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        compressed_path = temp_path / filename
+
+        # Guardar archivo comprimido
+        with open(compressed_path, 'wb') as f:
+            f.write(file_content)
+
+        try:
+            # Intentar extraer como ZIP
+            if filename.lower().endswith('.zip'):
+                with zipfile.ZipFile(compressed_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_path)
+            # Intentar extraer como RAR
+            elif filename.lower().endswith('.rar') and rarfile:
+                with rarfile.RarFile(compressed_path, 'r') as rar_ref:
+                    rar_ref.extractall(temp_path)
+            else:
+                return []
+
+            # Buscar todos los archivos XML extraídos
+            for xml_file in temp_path.rglob('*.xml'):
+                if xml_file.is_file():
+                    with open(xml_file, 'rb') as f:
+                        xml_files.append((xml_file.name, f.read()))
+
+        except Exception as e:
+            print(f"Error extracting {filename}: {str(e)}")
+
+    return xml_files
+
+
+def save_xml_file(file: UploadFile, base_path: str) -> tuple:
+    """Save XML file with date-based folder structure"""
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
+
+    # Crear estructura de carpetas: Insumos XML/YYYY/MM/DD
+    target_dir = Path(base_path) / "Insumos XML" / year / month / day
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Guardar archivo
+    file_path = target_dir / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return str(file_path), f"{year}/{month}/{day}/{file.filename}"
+
+
+def save_xml_content(filename: str, content: bytes, base_path: str) -> tuple:
+    """Save XML content with date-based folder structure"""
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
+
+    # Crear estructura de carpetas: Insumos XML/YYYY/MM/DD
+    target_dir = Path(base_path) / "Insumos XML" / year / month / day
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Guardar archivo
+    file_path = target_dir / filename
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    return str(file_path), f"{year}/{month}/{day}/{filename}"
+
+
+@router.post("/upload")
+async def upload_cfdis(
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Subir archivos XML de CFDIs
+    - Valida que sean archivos XML
+    - Extrae informaci�n del CFDI
+    - Guarda en estructura de carpetas por fecha
+    - Registra en base de datos
+    - Evita duplicados por UUID
+    """
+    base_path = "C:/Git/Coliman"
+    results = []
+    errors = []
+
+    for file in files:
+        try:
+            # Validar extensi�n
+            if not file.filename.endswith('.xml'):
+                errors.append({
+                    'filename': file.filename,
+                    'error': 'El archivo debe ser XML'
+                })
+                continue
+
+            # Leer contenido
+            content = await file.read()
+
+            # Parsear XML
+            cfdi_data = parse_cfdi_xml(content)
+
+            if not cfdi_data.get('uuid'):
+                errors.append({
+                    'filename': file.filename,
+                    'error': 'No se encontr� UUID en el XML'
+                })
+                continue
+
+            # Verificar duplicados en BD
+            existing_cfdi = db.execute(
+                """SELECT id FROM cfdi WHERE uuid = :uuid AND client_id = :client_id""",
+                {"uuid": cfdi_data['uuid'], "client_id": current_user.client_id}
+            ).fetchone()
+
+            if existing_cfdi:
+                errors.append({
+                    'filename': file.filename,
+                    'error': f'CFDI duplicado (UUID: {cfdi_data["uuid"]})'
+                })
+                continue
+
+            # Resetear puntero del archivo para guardarlo
+            file.file.seek(0)
+
+            # Guardar archivo f�sico
+            full_path, relative_path = save_xml_file(file, base_path)
+
+            # Insertar en base de datos
+            cfdi_id = db.execute(
+                """
+                INSERT INTO cfdi (
+                    client_id, uuid, tipo_comprobante, serie, folio, fecha,
+                    emisor_rfc, emisor_nombre, emisor_regimen,
+                    receptor_rfc, receptor_nombre, receptor_uso_cfdi,
+                    subtotal, descuento, total, moneda, tipo_cambio,
+                    total_impuestos_trasladados, total_impuestos_retenidos,
+                    metodo_pago, forma_pago,
+                    xml_path, estatus_validacion
+                ) VALUES (
+                    :client_id, :uuid, :tipo_comprobante, NULL, NULL, :fecha,
+                    :emisor_rfc, :emisor_nombre, :emisor_regimen,
+                    :receptor_rfc, :receptor_nombre, :receptor_uso_cfdi,
+                    :subtotal, 0, :total, :moneda, 1,
+                    :total_impuestos_trasladados, :total_impuestos_retenidos,
+                    :metodo_pago, :forma_pago,
+                    :xml_path, 'pendiente'
+                )
+                """,
+                {
+                    "client_id": current_user.client_id,
+                    "uuid": cfdi_data['uuid'],
+                    "tipo_comprobante": cfdi_data['tipo_comprobante'],
+                    "fecha": cfdi_data['fecha'],
+                    "emisor_rfc": cfdi_data.get('emisor_rfc'),
+                    "emisor_nombre": cfdi_data.get('emisor_nombre'),
+                    "emisor_regimen": cfdi_data.get('emisor_regimen'),
+                    "receptor_rfc": cfdi_data.get('receptor_rfc'),
+                    "receptor_nombre": cfdi_data.get('receptor_nombre'),
+                    "receptor_uso_cfdi": cfdi_data.get('receptor_uso_cfdi'),
+                    "subtotal": cfdi_data['subtotal'],
+                    "total": cfdi_data['total'],
+                    "moneda": cfdi_data['moneda'],
+                    "total_impuestos_trasladados": cfdi_data.get('total_impuestos_trasladados', 0),
+                    "total_impuestos_retenidos": cfdi_data.get('total_impuestos_retenidos', 0),
+                    "metodo_pago": cfdi_data.get('metodo_pago'),
+                    "forma_pago": cfdi_data.get('forma_pago'),
+                    "xml_path": relative_path
+                }
+            )
+            db.commit()
+
+            cfdi_id_value = cfdi_id.lastrowid if hasattr(cfdi_id, 'lastrowid') else None
+
+            # Insertar conceptos
+            for concepto in cfdi_data.get('conceptos', []):
+                db.execute(
+                    """
+                    INSERT INTO cfdi_conceptos (
+                        cfdi_id, clave_prod_serv, clave_unidad, cantidad,
+                        descripcion, valor_unitario, importe, descuento
+                    ) VALUES (
+                        :cfdi_id, :clave_prod_serv, :clave_unidad, :cantidad,
+                        :descripcion, :valor_unitario, :importe, :descuento
+                    )
+                    """,
+                    {
+                        "cfdi_id": cfdi_id_value,
+                        **concepto
+                    }
+                )
+            db.commit()
+
+            results.append({
+                'filename': file.filename,
+                'uuid': cfdi_data['uuid'],
+                'status': 'success',
+                'path': relative_path
+            })
+
+        except Exception as e:
+            errors.append({
+                'filename': file.filename,
+                'error': str(e)
+            })
+            continue
+
+    return {
+        'success': len(results),
+        'errors': len(errors),
+        'results': results,
+        'errors_detail': errors
+    }
+
+
+@router.post("/import-folder")
+async def import_from_folder(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Importar todos los archivos XML de la carpeta Insumos XML
+    - Escanea la carpeta C:/Git/Coliman/Insumos XML
+    - Copia archivos a estructura de carpetas por fecha
+    - Valida y registra en base de datos
+    - Evita duplicados por UUID
+    """
+    base_path = "C:/Git/Coliman"
+    source_folder = Path(base_path) / "Insumos XML"
+
+    if not source_folder.exists():
+        raise HTTPException(status_code=404, detail=f"Carpeta no encontrada: {source_folder}")
+
+    results = []
+    errors = []
+
+    # Buscar todos los archivos XML en la carpeta
+    xml_files = list(source_folder.glob("*.xml"))
+
+    if not xml_files:
+        return {
+            'success': 0,
+            'errors': 0,
+            'message': 'No se encontraron archivos XML en la carpeta',
+            'results': [],
+            'errors_detail': []
+        }
+
+    for xml_file in xml_files:
+        try:
+            # Leer contenido del archivo
+            with open(xml_file, 'rb') as f:
+                content = f.read()
+
+            # Parsear XML
+            cfdi_data = parse_cfdi_xml(content)
+
+            if not cfdi_data.get('uuid'):
+                errors.append({
+                    'filename': xml_file.name,
+                    'error': 'No se encontró UUID en el XML'
+                })
+                continue
+
+            # Verificar duplicados en BD
+            existing_cfdi = db.execute(
+                """SELECT id FROM cfdi WHERE uuid = :uuid AND client_id = :client_id""",
+                {"uuid": cfdi_data['uuid'], "client_id": current_user.client_id}
+            ).fetchone()
+
+            if existing_cfdi:
+                errors.append({
+                    'filename': xml_file.name,
+                    'error': f'CFDI duplicado (UUID: {cfdi_data["uuid"]})'
+                })
+                continue
+
+            # Copiar archivo a estructura de carpetas por fecha
+            now = datetime.now()
+            year = now.strftime("%Y")
+            month = now.strftime("%m")
+            day = now.strftime("%d")
+
+            target_dir = Path(base_path) / "Insumos XML" / "Subidos" / year / month / day
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            target_file = target_dir / xml_file.name
+            shutil.copy2(xml_file, target_file)
+
+            relative_path = f"Subidos/{year}/{month}/{day}/{xml_file.name}"
+
+            # Insertar en base de datos
+            cfdi_id = db.execute(
+                """
+                INSERT INTO cfdi (
+                    client_id, uuid, tipo_comprobante, serie, folio, fecha,
+                    emisor_rfc, emisor_nombre, emisor_regimen,
+                    receptor_rfc, receptor_nombre, receptor_uso_cfdi,
+                    subtotal, descuento, total, moneda, tipo_cambio,
+                    total_impuestos_trasladados, total_impuestos_retenidos,
+                    metodo_pago, forma_pago,
+                    xml_path, estatus_validacion
+                ) VALUES (
+                    :client_id, :uuid, :tipo_comprobante, NULL, NULL, :fecha,
+                    :emisor_rfc, :emisor_nombre, :emisor_regimen,
+                    :receptor_rfc, :receptor_nombre, :receptor_uso_cfdi,
+                    :subtotal, 0, :total, :moneda, 1,
+                    :total_impuestos_trasladados, :total_impuestos_retenidos,
+                    :metodo_pago, :forma_pago,
+                    :xml_path, 'pendiente'
+                )
+                """,
+                {
+                    "client_id": current_user.client_id,
+                    "uuid": cfdi_data['uuid'],
+                    "tipo_comprobante": cfdi_data['tipo_comprobante'],
+                    "fecha": cfdi_data['fecha'],
+                    "emisor_rfc": cfdi_data.get('emisor_rfc'),
+                    "emisor_nombre": cfdi_data.get('emisor_nombre'),
+                    "emisor_regimen": cfdi_data.get('emisor_regimen'),
+                    "receptor_rfc": cfdi_data.get('receptor_rfc'),
+                    "receptor_nombre": cfdi_data.get('receptor_nombre'),
+                    "receptor_uso_cfdi": cfdi_data.get('receptor_uso_cfdi'),
+                    "subtotal": cfdi_data['subtotal'],
+                    "total": cfdi_data['total'],
+                    "moneda": cfdi_data['moneda'],
+                    "total_impuestos_trasladados": cfdi_data.get('total_impuestos_trasladados', 0),
+                    "total_impuestos_retenidos": cfdi_data.get('total_impuestos_retenidos', 0),
+                    "metodo_pago": cfdi_data.get('metodo_pago'),
+                    "forma_pago": cfdi_data.get('forma_pago'),
+                    "xml_path": relative_path
+                }
+            )
+            db.commit()
+
+            cfdi_id_value = cfdi_id.lastrowid if hasattr(cfdi_id, 'lastrowid') else None
+
+            # Insertar conceptos
+            for concepto in cfdi_data.get('conceptos', []):
+                db.execute(
+                    """
+                    INSERT INTO cfdi_conceptos (
+                        cfdi_id, clave_prod_serv, clave_unidad, cantidad,
+                        descripcion, valor_unitario, importe, descuento
+                    ) VALUES (
+                        :cfdi_id, :clave_prod_serv, :clave_unidad, :cantidad,
+                        :descripcion, :valor_unitario, :importe, :descuento
+                    )
+                    """,
+                    {
+                        "cfdi_id": cfdi_id_value,
+                        **concepto
+                    }
+                )
+            db.commit()
+
+            results.append({
+                'filename': xml_file.name,
+                'uuid': cfdi_data['uuid'],
+                'status': 'success',
+                'path': relative_path
+            })
+
+        except Exception as e:
+            errors.append({
+                'filename': xml_file.name,
+                'error': str(e)
+            })
+            continue
+
+    return {
+        'success': len(results),
+        'errors': len(errors),
+        'total_files': len(xml_files),
+        'results': results,
+        'errors_detail': errors
+    }
+
+
+@router.get("/list")
+async def list_cfdis(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100
+):
+    """Listar CFDIs del cliente"""
+    cfdis = db.execute(
+        """
+        SELECT
+            id, uuid, fecha, tipo_comprobante,
+            emisor_rfc, emisor_nombre,
+            receptor_rfc, receptor_nombre,
+            subtotal, total, moneda,
+            estatus_validacion, created_at
+        FROM cfdi
+        WHERE client_id = :client_id
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :skip
+        """,
+        {
+            "client_id": current_user.client_id,
+            "limit": limit,
+            "skip": skip
+        }
+    ).fetchall()
+
+    # Convertir a lista de diccionarios
+    result = []
+    for cfdi in cfdis:
+        result.append({
+            'id': cfdi[0],
+            'uuid': cfdi[1],
+            'fecha': cfdi[2],
+            'tipo_comprobante': cfdi[3],
+            'emisor_rfc': cfdi[4],
+            'emisor_nombre': cfdi[5],
+            'receptor_rfc': cfdi[6],
+            'receptor_nombre': cfdi[7],
+            'subtotal': float(cfdi[8]) if cfdi[8] else 0,
+            'total': float(cfdi[9]) if cfdi[9] else 0,
+            'moneda': cfdi[10],
+            'estatus_validacion': cfdi[11],
+            'created_at': cfdi[12]
+        })
+
+    # Contar total
+    total = db.execute(
+        """SELECT COUNT(*) FROM cfdi WHERE client_id = :client_id""",
+        {"client_id": current_user.client_id}
+    ).fetchone()[0]
+
+    return {
+        'data': result,
+        'total': total,
+        'skip': skip,
+        'limit': limit
+    }

@@ -1,0 +1,39 @@
+# FastAPI y servidor
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Base de datos
+sqlalchemy==2.0.23
+pymysql==1.1.0
+cryptography>=38.0.0,<39.0.0
+alembic==1.12.1
+
+# Autenticación y seguridad
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.1
+
+# Validación y configuración
+pydantic==2.5.0
+pydantic-settings==2.1.0
+email-validator==2.1.1
+python-dotenv==1.0.0
+
+# Utilidades
+python-dateutil==2.8.2
+pytz==2023.3
+requests==2.31.0
+lxml==5.1.0
+PyPDF2==3.0.1
+
+# SAT CFDI y Descarga Masiva
+satcfdi==2.0.0
+
+# Archivos comprimidos
+rarfile==4.1
+py7zr==0.20.8
+
+# Testing (opcional)
+pytest==7.4.3
+httpx==0.25.2
